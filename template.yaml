@@ -1,0 +1,809 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  SVD Panalogix — infra Fases 3–6 (worker SQS, alertas Scheduler, HTTP API,
+  webhook SNS, S3, SNS, VPC privada, RDS Free Tier, Layer poppler).
+
+# ---------------------------------------------------------------------------
+# Anthropic egress (fuera de AWS): EnableNatGateway=false por defecto.
+# NAT Gateway + EIP en us-east-1 ≈ US$32–35/mes fijos + ~US$0.045/GB datos.
+# Sin NAT, el worker no alcanza api.anthropic.com; S3/SNS/SQS/Logs/KMS sí
+# vía VPC Endpoints. Activar solo para demos OCR reales.
+# Secretos: {{resolve:ssm:...}} en despliegue (NO ssm-secure: CloudFormation
+# no lo soporta en AWS::Lambda::Function/Environment/Variables — confirmado,
+# limitacion de AWS, ver github.com/aws/serverless-application-model#1528).
+# Sin sufijo de version: es opcional (doc oficial AWS) y asi siempre resuelve
+# la version mas reciente del parametro, sin quedar obsoleto si se sobrescribe.
+# Parametros SSM = tipo String (no SecureString) por esta limitacion; Lambda
+# cifra las env vars en reposo con su clave gestionada, pero el valor queda
+# legible en texto plano para cualquiera con permiso de lectura sobre
+# Parameter Store. Aceptado para dev; revisar Secrets Manager si esto avanza
+# a un entorno de produccion real. NO ssm:GetParameter en runtime (app/ no
+# llama a SSM). KMS PII: alias/panalogix-pii (existente).
+#
+# SSM String REQUERIDOS antes de sam deploy (tipo String, ultima version):
+#   /svd/${Environment}/DB_PASSWORD
+#   /svd/${Environment}/ANTHROPIC_API_KEY
+#   /svd/${Environment}/PANALOGIX_API_KEY
+#   /svd/${Environment}/RETOOL_API_KEY
+#   /svd/${Environment}/WEBHOOK_URL
+#   /svd/${Environment}/WEBHOOK_HMAC_SECRET
+# ---------------------------------------------------------------------------
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Tracing: Active
+    Timeout: 60
+    MemorySize: 256
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+  WorkerTimeout:
+    Type: Number
+    Default: 120
+    MinValue: 30
+    MaxValue: 900
+    Description: >-
+      Timeout del worker (s). Default 120 ante peor caso S3+PDF+Haiku/Sonnet+
+      DB+SNS. Validar con ejecución real medida.
+  EnableNatGateway:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: NAT Gateway para egress Anthropic (~US$32–35/mes). Default false.
+  PopplerLayerArn:
+    Type: String
+    Default: ''
+    Description: ARN de Layer poppler ya publicado; vacío = ContentUri layers/poppler
+  PrimaryModel:
+    Type: String
+    Default: claude-haiku-4-5-20251001
+  FallbackModel:
+    Type: String
+    Default: claude-sonnet-4-5-20250929
+  ConfidenceThreshold:
+    Type: Number
+    Default: 0.92
+  AuthenticityThreshold:
+    Type: Number
+    Default: 0.70
+  ExtractionVersion:
+    Type: String
+    Default: '1.0.0'
+  MaxPdfPages:
+    Type: Number
+    Default: 5
+  AuthPenaltyAnomalia:
+    Type: Number
+    Default: 0.100
+  AuthPenaltyTemporal:
+    Type: Number
+    Default: 0.200
+  AuthPenaltyExif:
+    Type: Number
+    Default: 0.150
+  AlertsCronExpression:
+    Type: String
+    Default: cron(0 8 * * ? *)
+    Description: Expresión cron (zona America/Panama en el Schedule)
+  PiiKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN de la CMK PII existente. Si vacío, IAM usa alias/panalogix-pii.
+      No crear AWS::KMS::Key en este stack.
+
+Conditions:
+  CreateNatGateway: !Equals [!Ref EnableNatGateway, 'true']
+  UseExternalPopplerLayer: !Not [!Equals [!Ref PopplerLayerArn, '']]
+  UseLocalPopplerLayer: !Equals [!Ref PopplerLayerArn, '']
+  UseExplicitPiiKmsArn: !Not [!Equals [!Ref PiiKmsKeyArn, '']]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # VPC (privada)
+  # -------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-vpc
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-private-b
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-private-rt
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # NAT opcional (costo fijo)
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNatGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNatGateway
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNatGateway
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-public-a
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNatGateway
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateNatGateway
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PrivateNatRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # -------------------------------------------------------------------------
+  # VPC Endpoints (sin SSM — app/ no usa GetParameter en runtime)
+  # -------------------------------------------------------------------------
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface endpoints HTTPS
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-vpce-sg
+
+  SqsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sqs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  SnsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sns
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  KmsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.kms
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # -------------------------------------------------------------------------
+  # Security groups + RDS (Free Tier: db.t3.micro, MultiAZ false, 20GB gp3)
+  # -------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SVD Lambdas (worker + alerts)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: VPC Endpoints, RDS privado y NAT opcional
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-lambda-sg
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SVD RDS PostgreSQL
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub svd-${Environment}-rds-sg
+
+  RdsIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: PostgreSQL solo desde Lambdas SVD
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: SVD private subnets
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub svd-${Environment}-pg
+      Engine: postgres
+      # Minor pin (cfn-lint W3691: major-only '17' se trata como deprecado)
+      EngineVersion: '17.10'
+      DBInstanceClass: db.t3.micro
+      MultiAZ: false
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      DBName: panalogix_svd
+      MasterUsername: svdadmin
+      MasterUserPassword: !Sub '{{resolve:ssm:/svd/${Environment}/DB_PASSWORD}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  # -------------------------------------------------------------------------
+  # SQS + SNS + S3 (orden: colas → política → buckets con notify)
+  # -------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub svd-${Environment}-worker-dlq
+      MessageRetentionPeriod: 1209600
+
+  MainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub svd-${Environment}-worker
+      # >= WorkerTimeout para no reaparecer el mensaje mientras corre la Lambda
+      VisibilityTimeout: !Ref WorkerTimeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  MainQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref MainQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3SendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt MainQueue.Arn
+            Condition:
+              ArnEquals:
+                # Nombre fijo (sin !GetAtt bucket) para evitar ciclo S3↔SQS
+                aws:SourceArn: !Sub arn:aws:s3:::svd-${Environment}-${AWS::AccountId}-raw
+
+  RawDocsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: MainQueuePolicy
+    Properties:
+      BucketName: !Sub svd-${Environment}-${AWS::AccountId}-raw
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveAndExpire
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 30
+            ExpirationInDays: 365
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt MainQueue.Arn
+
+  VerifiedDocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub svd-${Environment}-${AWS::AccountId}-verified
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AlertsAsyncFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub svd-${Environment}-alerts-async-dlq
+      MessageRetentionPeriod: 1209600
+
+  WebhookInvocationDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub svd-${Environment}-webhook-invocation-dlq
+      MessageRetentionPeriod: 1209600
+
+  ResultsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub svd-${Environment}-results
+      DisplayName: SVD Results
+
+  # -------------------------------------------------------------------------
+  # HTTP API (P6.1) — payload 1.0 para compatibilidad con api_handler
+  # -------------------------------------------------------------------------
+  SvdHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 50
+        ThrottlingBurstLimit: 100
+
+  # -------------------------------------------------------------------------
+  # Poppler Layer (solo worker) — ContentUri layers/poppler
+  # -------------------------------------------------------------------------
+  LocalPopplerLayer:
+    Type: AWS::Serverless::LayerVersion
+    Condition: UseLocalPopplerLayer
+    Properties:
+      LayerName: !Sub svd-${Environment}-poppler
+      Description: poppler binaries for pdf2image (ver layers/poppler/README.md)
+      ContentUri: layers/poppler/
+      CompatibleRuntimes:
+        - python3.12
+
+  # -------------------------------------------------------------------------
+  # Lambdas
+  # -------------------------------------------------------------------------
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub svd-${Environment}-worker
+      CodeUri: .
+      Handler: app.handlers.lambda_handler.handler
+      MemorySize: 512
+      Timeout: !Ref WorkerTimeout
+      Description: Pipeline verificación documental (SQS)
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      Layers:
+        - !If
+          - UseExternalPopplerLayer
+          - !Ref PopplerLayerArn
+          - !Ref LocalPopplerLayer
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          AWS_S3_RAW_BUCKET: !Ref RawDocsBucket
+          AWS_S3_VERIFIED_BUCKET: !Ref VerifiedDocsBucket
+          AWS_SQS_QUEUE_URL: !Ref MainQueue
+          AWS_SNS_TOPIC_ARN: !Ref ResultsTopic
+          DATABASE_URL: !Sub
+            - 'postgresql://svdadmin:{{resolve:ssm:/svd/${Environment}/DB_PASSWORD}}@${Host}:5432/panalogix_svd'
+            - Host: !GetAtt Database.Endpoint.Address
+          KMS_KEY_ID: alias/panalogix-pii
+          ANTHROPIC_API_KEY: !Sub '{{resolve:ssm:/svd/${Environment}/ANTHROPIC_API_KEY}}'
+          MODELO_PRIMARIO: !Ref PrimaryModel
+          MODELO_FALLBACK: !Ref FallbackModel
+          UMBRAL_CONFIANZA: !Ref ConfidenceThreshold
+          UMBRAL_AUTENTICIDAD: !Ref AuthenticityThreshold
+          VERSION_EXTRACCION: !Ref ExtractionVersion
+          MAX_PAGINAS_PDF: !Ref MaxPdfPages
+          AUTH_PENALTY_ANOMALIA: !Ref AuthPenaltyAnomalia
+          AUTH_PENALTY_TEMPORAL: !Ref AuthPenaltyTemporal
+          AUTH_PENALTY_EXIF: !Ref AuthPenaltyExif
+      Events:
+        WorkerSqs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MainQueue.Arn
+            BatchSize: 1
+            Enabled: true
+      Policies:
+        - VPCAccessPolicy: {}
+        - SQSPollerPolicy:
+            QueueName: !GetAtt MainQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ResultsTopic.TopicName
+        - S3ReadPolicy:
+            BucketName: !Ref RawDocsBucket
+        - S3WritePolicy:
+            BucketName: !Ref VerifiedDocsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:GenerateDataKey
+                - kms:DescribeKey
+              Resource: !If
+                - UseExplicitPiiKmsArn
+                - !Ref PiiKmsKeyArn
+                - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/panalogix-pii
+    Metadata:
+      BuildMethod: python3.12
+      BuildProperties:
+        RequirementsFile: requirements.txt
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub svd-${Environment}-api
+      CodeUri: .
+      Handler: app.handlers.api_handler.handler
+      MemorySize: 256
+      Timeout: 30
+      Description: >-
+        API REST (HTTP API payload 1.0). Una sola Lambda en VPC: endpoints
+        con RDS y POST /verificaciones/generar-url (solo S3) comparten cold
+        start VPC — trade-off aceptado, sin función separada.
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          AWS_SNS_TOPIC_ARN: !Ref ResultsTopic
+          AWS_S3_RAW_BUCKET: !Ref RawDocsBucket
+          AWS_SQS_QUEUE_URL: !Ref MainQueue
+          DATABASE_URL: !Sub
+            - 'postgresql://svdadmin:{{resolve:ssm:/svd/${Environment}/DB_PASSWORD}}@${Host}:5432/panalogix_svd'
+            - Host: !GetAtt Database.Endpoint.Address
+          KMS_KEY_ID: alias/panalogix-pii
+          PANALOGIX_API_KEY: !Sub '{{resolve:ssm:/svd/${Environment}/PANALOGIX_API_KEY}}'
+          RETOOL_API_KEY: !Sub '{{resolve:ssm:/svd/${Environment}/RETOOL_API_KEY}}'
+      Events:
+        ApiProxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SvdHttpApi
+            Path: /{proxy+}
+            Method: ANY
+            PayloadFormatVersion: '1.0'
+      Policies:
+        - VPCAccessPolicy: {}
+        - S3WritePolicy:
+            BucketName: !Ref RawDocsBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MainQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ResultsTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:GenerateDataKey
+                - kms:DescribeKey
+              Resource: !If
+                - UseExplicitPiiKmsArn
+                - !Ref PiiKmsKeyArn
+                - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/panalogix-pii
+    Metadata:
+      BuildMethod: python3.12
+      BuildProperties:
+        RequirementsFile: requirements.txt
+
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub svd-${Environment}-webhook
+      CodeUri: .
+      Handler: app.handlers.webhook_handler.handler
+      MemorySize: 256
+      # Peor caso retries HTTP ~37s + margen; ver webhook_service docstring.
+      Timeout: 60
+      Description: Emisor webhook HTTPS (SNS → POST firmado; fuera de VPC)
+      # Sin VpcConfig: solo SNS + HTTPS saliente; egress nativo sin NAT.
+      Environment:
+        Variables:
+          WEBHOOK_URL: !Sub '{{resolve:ssm:/svd/${Environment}/WEBHOOK_URL}}'
+          WEBHOOK_HMAC_SECRET: !Sub '{{resolve:ssm:/svd/${Environment}/WEBHOOK_HMAC_SECRET}}'
+      Events:
+        ResultsSns:
+          Type: SNS
+          Properties:
+            Topic: !Ref ResultsTopic
+      EventInvokeConfig:
+        # Un reintento barato ante bug/OOM/timeout genuino antes de DLQ.
+        # Riesgo residual aceptado: si timeout ocurre DESPUÉS de 2xx del
+        # receptor pero ANTES de retornar, este reintento puede duplicar
+        # el POST (llamada externa no idempotente). Baja probabilidad;
+        # mismo criterio que S3 verified no atómico (P4.2). Documentado
+        # también en app/handlers/webhook_handler.py.
+        MaximumRetryAttempts: 1
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt WebhookInvocationDlq.Arn
+      # IAM a WebhookInvocationDlq: SAM lo inyecta vía OnFailure (no statement manual).
+    Metadata:
+      BuildMethod: python3.12
+      BuildProperties:
+        RequirementsFile: requirements.txt
+
+  AlertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub svd-${Environment}-alerts
+      CodeUri: .
+      Handler: app.handlers.expiration_handler.handler
+      MemorySize: 256
+      Timeout: 60
+      Description: Alertas de vencimiento (EventBridge Scheduler)
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      # Solo env CommonSettings — sin ANTHROPIC / S3 / SQS / modelos de Worker
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          AWS_SNS_TOPIC_ARN: !Ref ResultsTopic
+          DATABASE_URL: !Sub
+            - 'postgresql://svdadmin:{{resolve:ssm:/svd/${Environment}/DB_PASSWORD}}@${Host}:5432/panalogix_svd'
+            - Host: !GetAtt Database.Endpoint.Address
+          KMS_KEY_ID: alias/panalogix-pii
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt AlertsAsyncFailureQueue.Arn
+      Policies:
+        - VPCAccessPolicy: {}
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ResultsTopic.TopicName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AlertsAsyncFailureQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:GenerateDataKey
+                - kms:DescribeKey
+              Resource: !If
+                - UseExplicitPiiKmsArn
+                - !Ref PiiKmsKeyArn
+                - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/panalogix-pii
+    Metadata:
+      BuildMethod: python3.12
+      BuildProperties:
+        RequirementsFile: requirements.txt
+
+  # -------------------------------------------------------------------------
+  # EventBridge Scheduler (America/Panama) → Alerts
+  # -------------------------------------------------------------------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub svd-${Environment}-alerts-scheduler
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeAlerts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AlertsFunction.Arn
+
+  AlertsSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub svd-${Environment}-expiration-daily
+      Description: Alertas vencimiento diario (America/Panama)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpression: !Ref AlertsCronExpression
+      ScheduleExpressionTimezone: America/Panama
+      State: ENABLED
+      Target:
+        Arn: !GetAtt AlertsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
+  AlertsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AlertsFunction
+      Principal: scheduler.amazonaws.com
+      SourceArn: !GetAtt AlertsSchedule.Arn
+
+Outputs:
+  MainQueueUrl:
+    Description: URL cola SQS worker
+    Value: !Ref MainQueue
+  DeadLetterQueueUrl:
+    Description: URL DLQ worker (redrive; sin consumo en código)
+    Value: !Ref DeadLetterQueue
+  ResultsTopicArn:
+    Description: ARN topic SNS
+    Value: !Ref ResultsTopic
+  RawDocsBucketName:
+    Value: !Ref RawDocsBucket
+  VerifiedDocsBucketName:
+    Value: !Ref VerifiedDocsBucket
+  VpcId:
+    Value: !Ref Vpc
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  WorkerFunctionArn:
+    Value: !GetAtt WorkerFunction.Arn
+  AlertsFunctionArn:
+    Value: !GetAtt AlertsFunction.Arn
+  ApiEndpoint:
+    Description: URL base HTTP API (payload 1.0 → api_handler)
+    Value: !Sub 'https://${SvdHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  ApiFunctionArn:
+    Value: !GetAtt ApiFunction.Arn
+  WebhookFunctionArn:
+    Value: !GetAtt WebhookFunction.Arn
+  WebhookInvocationDlqUrl:
+    Description: DLQ de fallos de invocación async del webhook (tras 1 reintento)
+    Value: !Ref WebhookInvocationDlq

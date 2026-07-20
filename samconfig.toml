@@ -1,0 +1,37 @@
+# SAM CLI config — SVD Panalogix (P5.1)
+# Prerequisitos de despliegue:
+#   - SSM SecureString /svd/{env}/DB_PASSWORD
+#   - SSM SecureString /svd/{env}/ANTHROPIC_API_KEY
+#   - KMS alias/panalogix-pii ya existente
+#   - Layer poppler empaquetado (ver layers/poppler/README.md) o PopplerLayerArn
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "svd-panalogix-dev"
+region = "us-east-1"
+confirm_changeset = true
+fail_on_empty_changeset = false
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+parameter_overrides = "Environment=\"dev\" WorkerTimeout=\"120\" EnableNatGateway=\"false\" PopplerLayerArn=\"\" PrimaryModel=\"claude-haiku-4-5\" FallbackModel=\"claude-sonnet-4-6\" ConfidenceThreshold=\"0.92\" AuthenticityThreshold=\"0.7\" ExtractionVersion=\"1.0.0\" MaxPdfPages=\"5\" AuthPenaltyAnomalia=\"0.1\" AuthPenaltyTemporal=\"0.2\" AuthPenaltyExif=\"0.15\" AlertsCronExpression=\"cron(0 8 * * ? *)\" PiiKmsKeyArn=\"\""
+s3_prefix = "svd-panalogix-dev"
+image_repositories = []
+
+[default.package.parameters]
+resolve_s3 = true
+
+[default.sync.parameters]
+watch = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"

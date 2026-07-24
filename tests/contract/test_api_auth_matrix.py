@@ -66,12 +66,49 @@ def test_panalogix_key_forbidden_on_retool_endpoints(
             "POST",
             "/verificaciones/11111111-1111-1111-1111-111111111111/resolver",
         ),
+        ("GET", "/admin/patrones"),
     ):
         resp = api_handler.handler(
             make_api_event(method, path, api_key=panalogix, body={}),
             None,
         )
         assert resp["statusCode"] == 403, path
+
+
+@pytest.mark.contract
+def test_retool_can_reach_admin_patrones_past_authz(
+    _api_keys: tuple[str, str],
+) -> None:
+    """AuthZ OK para Retool; el cuerpo lo provee el mock del pipeline."""
+    _, retool = _api_keys
+    pipeline = MagicMock()
+    pipeline.listar_patrones.return_value = {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"items": []}),
+    }
+    with patch.object(api_handler, "ApiPipeline", return_value=pipeline):
+        resp = api_handler.handler(
+            make_api_event("GET", "/admin/patrones", api_key=retool),
+            None,
+        )
+    assert resp["statusCode"] == 200
+    pipeline.listar_patrones.assert_called_once()
+
+
+@pytest.mark.contract
+def test_invalid_key_on_admin_patrones_returns_401(
+    _api_keys: tuple[str, str],
+) -> None:
+    resp = api_handler.handler(
+        make_api_event(
+            "GET",
+            "/admin/patrones",
+            api_key="totally-wrong-key-xxxxxx",
+        ),
+        None,
+    )
+    assert resp["statusCode"] == 401
 
 
 @pytest.mark.contract

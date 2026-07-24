@@ -19,6 +19,9 @@ from typing import Any
 
 from app.services.webhook_service import WebhookService
 from app.utils.logging import get_logger
+from app.utils.tracing import configure_xray
+
+configure_xray(patch_httplib=True)
 
 logger = get_logger(__name__)
 

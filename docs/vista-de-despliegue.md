@@ -25,7 +25,9 @@ Vista de Despliegue — Infraestructura Física
 
 ## 6.1 Zonas y canales de red
 
-El sistema se despliega en la región us-east-1 de AWS, organizado en tres zonas lógicas: cómputo serverless (las funciones Lambda, SQS, EventBridge y SNS), almacenamiento (los buckets S3 y la base de datos RDS), y seguridad y observabilidad (SSM, KMS, CloudWatch e IAM). Fuera de AWS residen los servicios externos: la API de Anthropic, las plataformas SaaS Retool y Grafana, y el backend de Panalogix en DigitalOcean.
+El sistema se despliega en la región us-east-1 de AWS, organizado en tres zonas lógicas: cómputo serverless (las funciones Lambda, SQS, EventBridge y SNS), almacenamiento (los buckets S3 y la base de datos RDS), y seguridad y observabilidad (SSM, KMS, CloudWatch, X-Ray e IAM). Fuera de AWS residen los servicios externos: la API de Anthropic, las plataformas SaaS Retool y Grafana, y el backend de Panalogix en DigitalOcean.
+
+Las cuatro Lambdas llevan tracing X-Ray activo (`Globals.Function.Tracing: Active`). El topic SNS de resultados usa `TracingConfig: Active` con política resource-based hacia X-Ray. La HTTP API (API Gateway v2) **no** emite segmentos X-Ray: el Trace Map comienza en `ApiFunction`. Las colas SQS y el fan-out SNS producen trazas enlazadas (no un único segmento continuo). El patch de `psycopg2` del SDK no incluye texto SQL ni parámetros bound en los subsegmentos.
 
 ## 6.2 Postura de seguridad de red
 

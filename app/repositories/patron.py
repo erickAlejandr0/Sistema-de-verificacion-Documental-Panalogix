@@ -120,3 +120,33 @@ class PatronRepository:
             return [Patron.model_validate(dict(r)) for r in rows]
         except psycopg2.Error as exc:
             raise RepositoryError("no se pudieron listar patrones") from exc
+
+    def listar_todos(self) -> list[Patron]:
+        """Lista todos los patrones (observación interna Retool / RF-22).
+
+        Orden pensado para una tabla estable en Retool: agrupa por tipo
+        de documento, y dentro de cada tipo muestra lo más reciente.
+
+        Returns:
+            Patrones ordenados por ``tipo_codigo ASC``,
+            ``actualizado_en DESC``, ``subtipo ASC``.
+        """
+        sql = """
+            SELECT
+                id, tipo_codigo, subtipo, estructura_detectada,
+                confianza_promedio, muestras, actualizado_en
+            FROM verificaciones.patrones
+            ORDER BY tipo_codigo ASC, actualizado_en DESC, subtipo ASC
+        """
+        try:
+            with get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(sql)
+                    rows = cur.fetchall()
+            return [Patron.model_validate(dict(r)) for r in rows]
+        except psycopg2.Error as exc:
+            logger.error(
+                "patron_listar_todos_failed",
+                extra={"context": {"error": type(exc).__name__}},
+            )
+            raise RepositoryError("no se pudieron listar patrones") from exc

@@ -26,7 +26,7 @@
 | M-WEBHOOK | `app/services/webhook_service.py` | Notificación a Panalogix vía webhook firmado. |
 | M-ORQ | `app/handlers/lambda_handler.py` | Orquestación del pipeline de verificación. |
 | M-ALERT | `app/handlers/expiration_handler.py` | Generación de alertas de vencimiento (EventBridge). |
-| M-API | `app/handlers/api_handler.py` | API REST de ingesta, consulta y resolución manual. |
+| M-API | `app/handlers/api_handler.py` | API REST de ingesta, consulta, resolución manual y observación interna de patrones (`GET /admin/patrones`, solo Retool). |
 | M-PATRON | `app/repositories/patron.py` + `app/services/pattern_learning.py` | Acumulación y consulta de patrones aprendidos (RF-22). |
 | M-FRONT | Vista transportista (Next.js) + Retool + Grafana | Interfaces de usuario y gestión. |
 
@@ -88,7 +88,7 @@
 | RF-19 | Alertar al equipo cuando un caso llega a revisión manual. | Should | CU-03 | HU-05 | M-NOTIF | Fase 4 / P4.1, P4.2 | Pendiente |
 | RF-20 | Permitir al equipo aprobar o rechazar manualmente. | Must | CU-03 | HU-05 | M-API | Fase 6 / P6.1 | Pendiente |
 | RF-21 | Registrar cada corrección humana como dato etiquetado. | Should | CU-03 | HU-06 | M-PERSIST | Fase 2 / P2.3 · Fase 6 / P6.1 | Pendiente |
-| RF-22 | Acumular patrones aprendidos por tipo y variante. | Could | — | HU-06 | M-PATRON | Fase 2 / P2.3 · Fase 4 / P4.2 | Hecho |
+| RF-22 | Acumular patrones aprendidos por tipo y variante. | Could | — | HU-06 | M-PATRON / M-API | Fase 2 / P2.3 · Fase 4 / P4.2 · Fase 6 / P6.1 (`GET /admin/patrones`) | Hecho |
 | RF-23 | Exponer métricas de precisión, volumen y costo. | Should | — | HU-07, HU-08 | M-FRONT | Fase 8 / P8.2 | Pendiente |
 | RF-24 | Versionar la configuración de extracción de cada verificación. | Should | CU-02 | — | M-OCR / M-PERSIST | Fase 3 / P3.1 · Fase 2 / P2.3 | Pendiente |
 | RF-25 | Permitir reprocesamiento de documentos históricos con prompts mejorados. | Could | — | HU-06 | M-PERSIST / M-OCR | Fase 2 / P2.3 · Fase 3 / P3.1 | Pendiente |

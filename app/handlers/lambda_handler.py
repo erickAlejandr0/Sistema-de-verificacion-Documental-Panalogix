@@ -73,6 +73,9 @@ from app.utils.dates import InvalidDateFormatError, parse_panama_date
 from app.utils.image import CorruptDocumentError, DocumentTooManyPagesError
 from app.utils.logging import get_logger
 from app.utils.metrics import emit_count
+from app.utils.tracing import configure_xray
+
+configure_xray()
 
 logger = get_logger(__name__)
 

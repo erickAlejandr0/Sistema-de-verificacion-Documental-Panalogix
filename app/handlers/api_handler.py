@@ -13,7 +13,9 @@ Auth:
         - panalogix: POST /verificaciones, GET /verificaciones/{tid},
           POST /verificaciones/generar-url
         - retool: GET /verificaciones/pendientes,
-          POST /verificaciones/{id}/resolver
+          POST /verificaciones/{id}/resolver,
+          GET /admin/patrones (solo observación interna; no contrato
+          externo con Panalogix)
 
 Infra SAM (API Gateway + Lambda + IAM) es tarea separada; este módulo solo
 implementa el código del handler.
@@ -46,6 +48,7 @@ from app.repositories.exceptions import (
     RepositoryError,
     S3RepositoryError,
 )
+from app.repositories.patron import PatronRepository
 from app.repositories.s3 import S3Repository
 from app.repositories.sqs import SqsRepository
 from app.repositories.verificacion import VerificacionRepository
@@ -63,6 +66,9 @@ from app.utils.metrics import (
     emit_count,
     normalize_campo_corregido_dimension,
 )
+from app.utils.tracing import configure_xray
+
+configure_xray()
 
 logger = get_logger(__name__)
 
@@ -87,6 +93,7 @@ _RETOOL_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/verificaciones/pendientes"),
         ("POST", "/verificaciones/{uuid}/resolver"),
+        ("GET", "/admin/patrones"),
     }
 )
 
@@ -163,6 +170,8 @@ def _match_route(method: str, path: str) -> tuple[str, str] | None:
         return ("POST", "/verificaciones/generar-url")
     if method == "GET" and path == "/verificaciones/pendientes":
         return ("GET", "/verificaciones/pendientes")
+    if method == "GET" and path == "/admin/patrones":
+        return ("GET", "/admin/patrones")
 
     m = re.fullmatch(r"/verificaciones/([^/]+)/resolver", path)
     if method == "POST" and m and _UUID_RE.fullmatch(m.group(1)):
@@ -214,12 +223,14 @@ class ApiPipeline:
         self,
         *,
         verificacion_repo: VerificacionRepository | None = None,
+        patron_repo: PatronRepository | None = None,
         s3_repo: S3Repository | None = None,
         sqs_repo: SqsRepository | None = None,
         notifications: NotificationService | None = None,
     ) -> None:
         """Inicializa dependencias (defaults desde settings / constructores)."""
         self._repo = verificacion_repo or VerificacionRepository()
+        self._patron_repo = patron_repo or PatronRepository()
         if s3_repo is None or sqs_repo is None or notifications is None:
             from app.config import get_api_settings
 
@@ -372,6 +383,28 @@ class ApiPipeline:
         )
         return _json_response(200, result)
 
+    def listar_patrones(self) -> dict[str, Any]:
+        """GET /admin/patrones → 200 (solo Retool; observación RF-22).
+
+        Proyecta únicamente campos públicos de observación: no expone
+        ``id`` ni ``subtipo``. ``estructura_detectada`` cruza la frontera
+        de red hacia Retool; contiene labels de campo (no valores PII).
+        """
+        patrones = self._patron_repo.listar_todos()
+        items: list[dict[str, Any]] = []
+        for patron in patrones:
+            dumped = patron.model_dump(mode="json")
+            items.append(
+                {
+                    "tipo_codigo": dumped["tipo_codigo"],
+                    "muestras": dumped["muestras"],
+                    "confianza_promedio": dumped["confianza_promedio"],
+                    "estructura_detectada": dumped["estructura_detectada"],
+                    "actualizado_en": dumped["actualizado_en"],
+                }
+            )
+        return _json_response(200, {"items": items})
+
 
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Punto de entrada Lambda (API Gateway REST).
@@ -433,6 +466,8 @@ def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
             if not isinstance(qs, dict):
                 qs = {}
             return pipeline.listar_pendientes(qs)
+        if method == "GET" and path == "/admin/patrones":
+            return pipeline.listar_patrones()
         if method == "POST" and path.endswith("/resolver"):
             return pipeline.resolver(_path_uuid(path, position=-2), _parse_json_body(event))
         if method == "GET" and path.startswith("/verificaciones/"):

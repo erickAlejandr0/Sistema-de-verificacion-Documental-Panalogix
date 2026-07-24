@@ -27,6 +27,9 @@ from app.repositories.verificacion import VerificacionRepository
 from app.services.sns import NonRetryableNotificationError, NotificationService
 from app.utils.dates import days_until_expiry
 from app.utils.logging import get_logger
+from app.utils.tracing import configure_xray
+
+configure_xray()
 
 logger = get_logger(__name__)
 

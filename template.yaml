@@ -474,6 +474,42 @@ Resources:
     Properties:
       TopicName: !Sub svd-${Environment}-results
       DisplayName: SVD Results
+      TracingConfig: Active
+
+  # Política resource-based: SNS → X-Ray (requerida con TracingConfig: Active).
+  # Límite AWS: máx. 5 políticas X-Ray por cuenta/región; PolicyName único.
+  SnsXrayResourcePolicy:
+    Type: AWS::XRay::ResourcePolicy
+    Properties:
+      PolicyName: !Sub svd-${Environment}-sns-xray
+      BypassPolicyLockoutCheck: false
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "SNSAccess",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "sns.amazonaws.com"
+              },
+              "Action": [
+                "xray:PutTraceSegments",
+                "xray:GetSamplingRules",
+                "xray:GetSamplingTargets"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": "${AWS::AccountId}"
+                },
+                "StringLike": {
+                  "aws:SourceArn": "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:svd-${Environment}-results"
+                }
+              }
+            }
+          ]
+        }
 
   # -------------------------------------------------------------------------
   # HTTP API (P6.1) — payload 1.0 para compatibilidad con api_handler

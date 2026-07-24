@@ -23,7 +23,7 @@ lint = true
 [default.deploy.parameters]
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
 resolve_s3 = true
-parameter_overrides = "Environment=\"dev\" WorkerTimeout=\"120\" EnableNatGateway=\"false\" PopplerLayerArn=\"\" PrimaryModel=\"claude-haiku-4-5\" FallbackModel=\"claude-sonnet-4-6\" ConfidenceThreshold=\"0.92\" AuthenticityThreshold=\"0.7\" ExtractionVersion=\"1.0.0\" MaxPdfPages=\"5\" AuthPenaltyAnomalia=\"0.1\" AuthPenaltyTemporal=\"0.2\" AuthPenaltyExif=\"0.15\" AlertsCronExpression=\"cron(0 8 * * ? *)\" PiiKmsKeyArn=\"\""
+parameter_overrides = "Environment=\"dev\" WorkerTimeout=\"120\" EnableNatGateway=\"true\" PopplerLayerArn=\"\" PrimaryModel=\"claude-haiku-4-5\" FallbackModel=\"claude-sonnet-4-6\" ConfidenceThreshold=\"0.92\" AuthenticityThreshold=\"0.7\" ExtractionVersion=\"1.0.0\" MaxPdfPages=\"5\" AuthPenaltyAnomalia=\"0.1\" AuthPenaltyTemporal=\"0.2\" AuthPenaltyExif=\"0.15\" AlertsCronExpression=\"cron(0 8 * * ? *)\" PiiKmsKeyArn=\"arn:aws:kms:us-east-1:290488660858:key/99ba1e64-64c1-4d33-b950-276f58a3b73b\""
 s3_prefix = "svd-panalogix-dev"
 image_repositories = []
 

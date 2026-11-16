@@ -57,6 +57,7 @@ dmypy.json
 *.swo
 .DS_Store
 Thumbs.db
+.cursor/
 
 # Jupyter
 .ipynb_checkpoints/
